@@ -2,6 +2,7 @@ package com.github.huchangjun118.containerconfigresolverjava.config;
 
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.CircularReferenceException;
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.Interpolator;
+import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.InvalidSyntaxException;
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.ReferenceTypeException;
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.UndefinedReferenceException;
 import com.github.huchangjun118.containerconfigresolverjava.config.model.ContainerConfig;
@@ -104,5 +105,98 @@ class InterpolatorTest {
         // 即使 image 可解析，整体仍失败
         assertThrows(UndefinedReferenceException.class,
                 () -> interpolator.interpolate(c, Map.of("TAG", "1")));
+    }
+
+    // ---- 非法 $ 写法：必须报错，绝不原样带出，也不替换成空串 ----
+
+    @Test
+    void danglingDollarAtEnd_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder().image("abc$").build();
+        InvalidSyntaxException ex = assertThrows(InvalidSyntaxException.class,
+                () -> interpolator.interpolate(c, Map.of()));
+        assertTrue(ex.getMessage().contains("dangling"));
+        assertEquals("abc$", ex.offendingText());
+    }
+
+    @Test
+    void loneDollarOnly_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder().image("$").build();
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void dollarFollowedByLetter_throwsInvalidSyntax_notPassedThrough() {
+        ContainerConfig c = ContainerConfig.builder().image("price is $5 today").build();
+        InvalidSyntaxException ex = assertThrows(InvalidSyntaxException.class,
+                () -> interpolator.interpolate(c, Map.of()));
+        assertTrue(ex.getMessage().contains("$5"));
+    }
+
+    @Test
+    void oddNumberOfDollarsAtEnd_throwsInvalidSyntax() {
+        // $$$ -> 第一对 $$ 转义成一个 $，最后一个 $ 悬空落在结尾 -> 非法
+        ContainerConfig c = ContainerConfig.builder().image("$$$").build();
+        InvalidSyntaxException ex = assertThrows(InvalidSyntaxException.class,
+                () -> interpolator.interpolate(c, Map.of()));
+        assertTrue(ex.getMessage().contains("dangling"));
+    }
+
+    @Test
+    void unterminatedBraceReference_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder().image("${env:TAG").build();
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void emptyReference_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder().image("${}").build();
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void emptyExternalReference_throwsInvalidSyntax_notUndefined() {
+        ContainerConfig c = ContainerConfig.builder().image("${env:}").build();
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void danglingDollarInListItem_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder()
+                .entrypoint(List.of("/app/server", "--flag=$"))
+                .build();
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void invalidSyntaxIsDistinguishableFromOtherInterpolationFailures() {
+        // 写法非法 vs 取值不存在
+        assertThrows(InvalidSyntaxException.class,
+                () -> interpolator.interpolate(ContainerConfig.builder().image("$").build(), Map.of()));
+        assertThrows(UndefinedReferenceException.class,
+                () -> interpolator.interpolate(
+                        ContainerConfig.builder().image("${env:NOPE}").build(), Map.of()));
+
+        // 写法非法 vs 引用成环
+        assertThrows(CircularReferenceException.class,
+                () -> interpolator.interpolate(
+                        ContainerConfig.builder().env(Map.of("A", "${env.A}")).build(), Map.of()));
+
+        // 写法非法 vs 引用类型不对
+        assertThrows(ReferenceTypeException.class,
+                () -> interpolator.interpolate(ContainerConfig.builder()
+                        .image("${entrypoint}")
+                        .entrypoint(List.of("/app/server"))
+                        .build(), Map.of()));
+    }
+
+    @Test
+    void legalEscapeStillResolves() {
+        // $$ 转义与悬空 $ 的边界：结尾两个 $ 合法、一个 $ 非法
+        assertEquals("$", interpolator.interpolate(
+                ContainerConfig.builder().image("$$").build(), Map.of()).image());
+        assertEquals("${HOME}", interpolator.interpolate(
+                ContainerConfig.builder().image("$${HOME}").build(), Map.of("HOME", "/root")).image());
+        assertEquals("a$b", interpolator.interpolate(
+                ContainerConfig.builder().image("a$$b").build(), Map.of()).image());
     }
 }

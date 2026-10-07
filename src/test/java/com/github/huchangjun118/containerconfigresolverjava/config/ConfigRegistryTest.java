@@ -243,4 +243,127 @@ class ConfigRegistryTest {
         assertEquals(r1.current().config().entrypoint(), r2.current().config().entrypoint());
         assertEquals(r1.current().provenance(), r2.current().provenance());
     }
+
+    @Test
+    void readsNeverObserveCrossLayerEntrypointCommandMixing_underConcurrentReloads() throws Exception {
+        // 每次重载两份来源固定不变：镜像默认 E0+C0；服务层只给入口点 E1（命令耦合重置）。
+        // 若读到来路不明的组合（如 E1 + C0），说明出现了跨层拼接或字段级中间态。
+        java.util.function.Supplier<List<ConfigSource>> provider = () -> {
+            ConfigSource base = new ConfigSource("base", "base", SourcePriority.BASE_TEMPLATE,
+                    ContainerConfig.builder()
+                            .image("img")
+                            .platform("linux/amd64")
+                            .entrypoint(List.of("/img/default-entry"))
+                            .command(List.of("--img-default-arg"))
+                            .build());
+            ConfigSource svc = new ConfigSource("svc", "svc", SourcePriority.SERVICE,
+                    ContainerConfig.builder()
+                            .entrypoint(List.of("/svc/entry"))
+                            .build());
+            return List.of(svc, base);
+        };
+        ConfigRegistry registry = registry(provider);
+
+        int readerCount = 8;
+        int iterations = 2000;
+        ExecutorService pool = Executors.newFixedThreadPool(readerCount + 1);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicBoolean inconsistent = new AtomicBoolean(false);
+
+        Future<?>[] readers = new Future<?>[readerCount];
+        for (int i = 0; i < readerCount; i++) {
+            readers[i] = pool.submit(() -> {
+                try {
+                    start.await();
+                    for (int k = 0; k < iterations; k++) {
+                        ResolvedConfig c = registry.current();
+                        if (c == null) {
+                            continue;
+                        }
+                        var cfg = c.config();
+                        boolean committedPair =
+                                cfg.entrypoint().equals(List.of("/svc/entry"))
+                                        && cfg.command().equals(List.of());
+                        if (!committedPair) {
+                            inconsistent.set(true);
+                        }
+                        // 入口点与命令的来源必须自洽：命令为 svc 层入口点触发的耦合重置
+                        var cmdProv = c.provenance().get("command");
+                        if (cmdProv == null
+                                || !"svc".equals(cmdProv.sourceId())
+                                || cmdProv.kind() != com.github.huchangjun118.containerconfigresolverjava
+                                        .config.model.Provenance.Kind.COUPLED_RESET) {
+                            inconsistent.set(true);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+
+        Future<?> writer = pool.submit(() -> {
+            try {
+                start.await();
+                for (int k = 0; k < 500; k++) {
+                    registry.reload();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        start.countDown();
+        writer.get(30, TimeUnit.SECONDS);
+        for (Future<?> r : readers) {
+            r.get(30, TimeUnit.SECONDS);
+        }
+        pool.shutdownNow();
+
+        assertTrue(!inconsistent.get(), "read observed a cross-layer mixed entrypoint/command pair");
+        assertEquals(List.of("/svc/entry"), registry.current().config().entrypoint());
+        assertEquals(List.of(), registry.current().config().command());
+    }
+
+    @Test
+    void invalidSyntaxReload_isReportedAndIsolatedAndServiceKeepsServing() {
+        AtomicBoolean broken = new AtomicBoolean(false);
+        ConfigRegistry registry = registry(() -> {
+            if (broken.get()) {
+                return List.of(new ConfigSource("base", "base", SourcePriority.BASE_TEMPLATE,
+                        ContainerConfig.builder()
+                                .image("img:bad$") // 悬空 $：写法非法
+                                .platform("linux/amd64")
+                                .entrypoint(List.of("/app/server"))
+                                .build()));
+            }
+            return List.of(validSource("base", "img:1"));
+        });
+
+        ReloadResult first = registry.reload();
+        assertTrue(first instanceof ReloadResult.Success);
+
+        // 多次用非法写法的来源重载：全部失败、原因可查，但上一版本持续生效
+        broken.set(true);
+        for (int i = 0; i < 5; i++) {
+            ReloadResult r = registry.reload();
+            assertTrue(r instanceof ReloadResult.Failure);
+            ResolvedConfig c = registry.current();
+            assertNotNull(c);
+            assertEquals("img:1", c.config().image()); // 读取始终拿到已提交版本
+        }
+        assertEquals(5, registry.consecutiveFailures());
+        assertNotNull(registry.lastFailure());
+        // 错误原因可区分到“写法非法”这一类
+        assertTrue(registry.lastFailure().reason().contains("InvalidSyntaxException"),
+                "failure reason should expose syntax error category: "
+                        + registry.lastFailure().reason());
+
+        // 恢复：服务无需重启即可继续提交新版本
+        broken.set(false);
+        ReloadResult recovered = registry.reload();
+        assertTrue(recovered instanceof ReloadResult.Success);
+        assertEquals(0, registry.consecutiveFailures());
+        assertNull(registry.lastFailure());
+    }
 }

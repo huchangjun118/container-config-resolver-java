@@ -21,10 +21,16 @@ import java.util.function.BiConsumer;
  *   <li>标量字段（image/platform/arch/workingDir/user/privileged/readOnlyRootFilesystem）：
  *       高优先级非空值整体替换低优先级值；</li>
  *   <li>映射字段（env/labels）：字段级合并，低优先级的键保留，高优先级的同键覆盖；</li>
- *   <li>列表字段（entrypoint/command/ports/volumes）：高优先级非空列表整体替换；
- *       显式空列表表示重置；</li>
- *   <li>入口点与命令相互独立，各自遵循列表整体替换语义（符合容器运行时既有语义）。</li>
+ *   <li>列表字段（ports/volumes）：高优先级非空列表整体替换；显式空列表表示重置；</li>
+ *   <li>入口点与命令遵循容器运行时（Docker）耦合语义：<ul>
+ *       <li>同层同时给出入口点与命令：两者都生效（空列表为显式重置）；</li>
+ *       <li>同层只给出非空入口点、未给出命令：命令被联动重置为空（COUPLED_RESET），
+ *           不再沿用镜像或低优先级来源的旧命令；</li>
+ *       <li>同层只给出命令：入口点继续继承；</li>
+ *       <li>同层显式给出空入口点：只重置入口点本身，不联动命令。</li>
+ *   </ul></li>
  * </ul>
+ * 重置与“恰好覆盖成空值”通过 {@link Provenance.Kind} 区分。
  */
 public class ConfigMerger {
 
@@ -68,8 +74,7 @@ public class ConfigMerger {
             mergeMap(envAcc, f.env(), "env", sid, prov);
             mergeMap(labelsAcc, f.labels(), "labels", sid, prov);
 
-            mergeList(b, "entrypoint", f.entrypoint(), sid, prov, ContainerConfig.Builder::entrypoint);
-            mergeList(b, "command", f.command(), sid, prov, ContainerConfig.Builder::command);
+            mergeEntrypointCommand(b, f, sid, prov);
             mergePorts(b, f.ports(), sid, prov);
             mergeVolumes(b, f.volumes(), sid, prov);
         }
@@ -100,12 +105,37 @@ public class ConfigMerger {
         }
     }
 
-    private <T> void mergeList(ContainerConfig.Builder b, String field, List<T> value, String sourceId,
-                               Map<String, Provenance> prov,
-                               BiConsumer<ContainerConfig.Builder, List<T>> setter) {
-        if (value != null) {
-            setter.accept(b, new ArrayList<>(value));
-            prov.put(field, new Provenance(sourceId, field));
+    /**
+     * 入口点与命令的耦合合并。
+     *
+     * <p>对单个来源：
+     * <ul>
+     *   <li>入口点非 null：整体替换（空列表为显式重置 EXPLICIT_RESET）；</li>
+     *   <li>命令非 null：整体替换（空列表为显式重置 EXPLICIT_RESET）；</li>
+     *   <li>入口点非 null 且非空、命令为 null：命令被联动重置为空（COUPLED_RESET），
+     *       追溯到触发该联动的来源与入口点路径；</li>
+     *   <li>其余情况未指定的字段保持继承。</li>
+     * </ul>
+     */
+    private void mergeEntrypointCommand(ContainerConfig.Builder b, ContainerConfig f, String sourceId,
+                                        Map<String, Provenance> prov) {
+        List<String> entrypoint = f.entrypoint();
+        List<String> command = f.command();
+
+        if (entrypoint != null) {
+            b.entrypoint(new ArrayList<>(entrypoint));
+            prov.put("entrypoint", new Provenance(sourceId, "entrypoint",
+                    entrypoint.isEmpty() ? Provenance.Kind.EXPLICIT_RESET : Provenance.Kind.VALUE));
+        }
+
+        if (command != null) {
+            b.command(new ArrayList<>(command));
+            prov.put("command", new Provenance(sourceId, "command",
+                    command.isEmpty() ? Provenance.Kind.EXPLICIT_RESET : Provenance.Kind.VALUE));
+        } else if (entrypoint != null && !entrypoint.isEmpty()) {
+            // 只给非空入口点、没给命令：镜像/低优先级的旧命令不得拼接在新入口点后。
+            b.command(new ArrayList<>());
+            prov.put("command", new Provenance(sourceId, "entrypoint", Provenance.Kind.COUPLED_RESET));
         }
     }
 

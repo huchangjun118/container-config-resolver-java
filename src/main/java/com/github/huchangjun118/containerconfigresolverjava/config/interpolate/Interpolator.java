@@ -18,8 +18,13 @@ import java.util.Set;
  *   <li>{@code $$}：转义，输出字面量 {@code $}（如 {@code $${HOME}} 输出 {@code ${HOME}}）。</li>
  * </ul>
  *
- * <p>未定义引用、循环引用、类型错误分别抛出 {@link UndefinedReferenceException}、
- * {@link CircularReferenceException}、{@link ReferenceTypeException}，绝不静默替换。
+ * <p>未定义引用、循环引用、类型错误、非法写法分别抛出
+ * {@link UndefinedReferenceException}、{@link CircularReferenceException}、
+ * {@link ReferenceTypeException}、{@link InvalidSyntaxException}，绝不静默替换或原样输出。
+ *
+ * <p>{@code $} 只能出现在两种合法形态中：{@code $$}（转义）与 {@code ${...}}（引用）。
+ * 孤零零的 {@code $}（含落在字符串末尾）、{@code $x} 之类的跟随字符、未闭合的
+ * {@code ${...}、空引用 {@code ${}}、空外部引用 {@code ${env:}} 都属于写法非法。
  */
 public class Interpolator {
 
@@ -139,7 +144,13 @@ public class Interpolator {
         int n = template.length();
         while (i < n) {
             char c = template.charAt(i);
-            if (c == '$' && i + 1 < n) {
+            if (c == '$') {
+                // $ 必须构成 $$ 转义或 ${...} 引用，否则一律按非法写法报错，
+                // 绝不原样带出，也不静默替换成空串。
+                if (i + 1 >= n) {
+                    throw new InvalidSyntaxException(
+                            "invalid interpolation syntax: dangling '$' at end of: " + template, template);
+                }
                 char next = template.charAt(i + 1);
                 if (next == '$') {
                     // 转义：$$ -> $
@@ -150,13 +161,18 @@ public class Interpolator {
                 if (next == '{') {
                     int close = template.indexOf('}', i + 2);
                     if (close < 0) {
-                        throw new InterpolationException("unterminated reference in: " + template);
+                        throw new InvalidSyntaxException(
+                                "invalid interpolation syntax: unterminated '${' in: " + template, template);
                     }
                     String spec = template.substring(i + 2, close);
                     out.append(resolveReference(spec, scalars, env, labels, external, stack));
                     i = close + 1;
                     continue;
                 }
+                throw new InvalidSyntaxException(
+                        "invalid interpolation syntax: '$' must be escaped as '$$' or start a '${...}' "
+                                + "reference, got '$" + next + "' in: " + template,
+                        template);
             }
             out.append(c);
             i++;
@@ -167,10 +183,16 @@ public class Interpolator {
     private String resolveReference(String spec, Map<String, String> scalars,
                                     Map<String, String> env, Map<String, String> labels,
                                     Map<String, String> external, Set<String> stack) {
+        if (spec.isEmpty()) {
+            throw new InvalidSyntaxException(
+                    "invalid interpolation syntax: empty reference '${}'", "${}");
+        }
+
         if (spec.startsWith(EXTERNAL_PREFIX)) {
             String name = spec.substring(EXTERNAL_PREFIX.length());
             if (name.isEmpty()) {
-                throw new UndefinedReferenceException("empty external reference: ${env:}");
+                throw new InvalidSyntaxException(
+                        "invalid interpolation syntax: empty external reference '${env:}'", "${env:}");
             }
             String value = external.get(name);
             if (value == null) {
