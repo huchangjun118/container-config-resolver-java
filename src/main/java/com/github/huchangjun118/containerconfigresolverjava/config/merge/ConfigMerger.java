@@ -23,7 +23,9 @@ import java.util.function.BiConsumer;
  *   <li>映射字段（env/labels）：字段级合并，低优先级的键保留，高优先级的同键覆盖；</li>
  *   <li>列表字段（entrypoint/command/ports/volumes）：高优先级非空列表整体替换；
  *       显式空列表表示重置；</li>
- *   <li>入口点与命令相互独立，各自遵循列表整体替换语义（符合容器运行时既有语义）。</li>
+ *   <li>入口点与命令联动：某一层只给出入口点而未给出命令时，命令被重置为空
+ *       （provenance 标记为 RESET），不再沿用镜像或低优先级来源的旧命令；
+ *       同一层同时给出两者时都生效；只给出命令时入口点继续继承。</li>
  * </ul>
  */
 public class ConfigMerger {
@@ -69,7 +71,14 @@ public class ConfigMerger {
             mergeMap(labelsAcc, f.labels(), "labels", sid, prov);
 
             mergeList(b, "entrypoint", f.entrypoint(), sid, prov, ContainerConfig.Builder::entrypoint);
-            mergeList(b, "command", f.command(), sid, prov, ContainerConfig.Builder::command);
+            if (f.command() != null) {
+                mergeList(b, "command", f.command(), sid, prov, ContainerConfig.Builder::command);
+            } else if (f.entrypoint() != null) {
+                // 该层只给出入口点而未给出命令：命令必须重置，
+                // 不得把镜像或低优先级来源里的旧命令接在新入口点后面当参数。
+                b.command(new ArrayList<>());
+                prov.put("command", new Provenance(sid, "command", Provenance.Kind.RESET));
+            }
             mergePorts(b, f.ports(), sid, prov);
             mergeVolumes(b, f.volumes(), sid, prov);
         }

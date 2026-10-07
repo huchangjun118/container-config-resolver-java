@@ -243,4 +243,120 @@ class ConfigRegistryTest {
         assertEquals(r1.current().config().entrypoint(), r2.current().config().entrypoint());
         assertEquals(r1.current().provenance(), r2.current().provenance());
     }
+
+    @Test
+    void invalidSyntaxReload_keepsPreviousVersion_andReasonIsQueryable() {
+        AtomicBoolean broken = new AtomicBoolean(false);
+        ConfigRegistry registry = registry(() -> {
+            if (broken.get()) {
+                // 字段值末尾孤零零的 $：非法写法，必须让整次求值失败
+                return List.of(new ConfigSource("base", "base", SourcePriority.BASE_TEMPLATE,
+                        ContainerConfig.builder()
+                                .image("img:bad$")
+                                .platform("linux/amd64")
+                                .entrypoint(List.of("/app/server"))
+                                .build()));
+            }
+            return List.of(validSource("base", "img:1"));
+        });
+
+        registry.reload();
+        assertEquals(1, registry.currentVersion());
+
+        // 反复失败：服务不中断，已生效版本不被污染，失败原因始终可查询
+        broken.set(true);
+        for (int i = 1; i <= 3; i++) {
+            ReloadResult r = registry.reload();
+            assertTrue(r instanceof ReloadResult.Failure);
+            assertEquals(1, registry.currentVersion());
+            assertEquals("img:1", registry.current().config().image());
+            assertNotNull(registry.lastFailure());
+            assertTrue(registry.lastFailure().reason().contains("InvalidSyntaxException"));
+            assertEquals(i, registry.consecutiveFailures());
+        }
+
+        // 恢复后正常提交，失败计数清零
+        broken.set(false);
+        ReloadResult r = registry.reload();
+        assertTrue(r instanceof ReloadResult.Success);
+        assertEquals(0, registry.consecutiveFailures());
+    }
+
+    @Test
+    void entrypointCommandPair_isSelfConsistent_underConcurrentReloads() throws Exception {
+        // 两种已提交形态交替出现：
+        //   形态A：入口点 /app/server + 命令 --port 8080（均来自镜像层）
+        //   形态B：服务层只覆盖入口点 -> 入口点 /bin/sh + 命令被重置为空
+        AtomicInteger counter = new AtomicInteger(0);
+        ConfigRegistry registry = registry(() -> {
+            int n = counter.incrementAndGet();
+            ConfigSource base = new ConfigSource("base", "base", SourcePriority.BASE_TEMPLATE,
+                    ContainerConfig.builder()
+                            .image("img:1")
+                            .platform("linux/amd64")
+                            .entrypoint(List.of("/app/server"))
+                            .command(List.of("--port", "8080"))
+                            .build());
+            if (n % 2 == 0) {
+                ConfigSource svc = new ConfigSource("svc", "svc", SourcePriority.SERVICE,
+                        ContainerConfig.builder().entrypoint(List.of("/bin/sh")).build());
+                return List.of(base, svc);
+            }
+            return List.of(base);
+        });
+
+        int readerCount = 8;
+        int iterations = 2000;
+        ExecutorService pool = Executors.newFixedThreadPool(readerCount + 1);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicBoolean inconsistent = new AtomicBoolean(false);
+
+        Future<?>[] readers = new Future[readerCount];
+        for (int i = 0; i < readerCount; i++) {
+            readers[i] = pool.submit(() -> {
+                try {
+                    start.await();
+                    for (int k = 0; k < iterations; k++) {
+                        ResolvedConfig c = registry.current();
+                        if (c != null) {
+                            List<String> ep = c.config().entrypoint();
+                            List<String> cmd = c.config().command();
+                            boolean shapeA = List.of("/app/server").equals(ep)
+                                    && List.of("--port", "8080").equals(cmd);
+                            boolean shapeB = List.of("/bin/sh").equals(ep)
+                                    && cmd != null && cmd.isEmpty();
+                            // 不允许出现入口点来自形态B而命令来自形态A的拼接结果
+                            if (!shapeA && !shapeB) {
+                                inconsistent.set(true);
+                            }
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+
+        Future<?> writer = pool.submit(() -> {
+            try {
+                start.await();
+                for (int k = 0; k < 500; k++) {
+                    registry.reload();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        start.countDown();
+        writer.get(30, TimeUnit.SECONDS);
+        for (Future<?> r : readers) {
+            r.get(30, TimeUnit.SECONDS);
+        }
+        pool.shutdownNow();
+
+        assertTrue(!inconsistent.get(),
+                "read observed entrypoint/command mixed from different committed versions");
+        assertEquals(500, registry.currentVersion());
+    }
 }

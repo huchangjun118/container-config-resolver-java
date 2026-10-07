@@ -1,7 +1,9 @@
 package com.github.huchangjun118.containerconfigresolverjava.config;
 
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.CircularReferenceException;
+import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.InterpolationException;
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.Interpolator;
+import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.InvalidSyntaxException;
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.ReferenceTypeException;
 import com.github.huchangjun118.containerconfigresolverjava.config.interpolate.UndefinedReferenceException;
 import com.github.huchangjun118.containerconfigresolverjava.config.model.ContainerConfig;
@@ -104,5 +106,81 @@ class InterpolatorTest {
         // 即使 image 可解析，整体仍失败
         assertThrows(UndefinedReferenceException.class,
                 () -> interpolator.interpolate(c, Map.of("TAG", "1")));
+    }
+
+    @Test
+    void danglingDollarAtEndOfValue_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder()
+                .image("registry/app$")
+                .build();
+        InvalidSyntaxException ex = assertThrows(InvalidSyntaxException.class,
+                () -> interpolator.interpolate(c, Map.of()));
+        assertTrue(ex.getMessage().contains("dangling"));
+    }
+
+    @Test
+    void dollarFollowedByPlainChar_throwsInvalidSyntax_notPassedThrough() {
+        ContainerConfig c = ContainerConfig.builder()
+                .env(Map.of("HOME_REF", "$HOME"))
+                .build();
+        // $H 既不是合法引用也不是合法转义：必须报错，不得原样输出
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void unterminatedReference_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder()
+                .image("${env.REGISTRY")
+                .build();
+        InvalidSyntaxException ex = assertThrows(InvalidSyntaxException.class,
+                () -> interpolator.interpolate(c, Map.of()));
+        assertTrue(ex.getMessage().contains("unterminated"));
+    }
+
+    @Test
+    void emptyReference_throwsInvalidSyntax() {
+        ContainerConfig c = ContainerConfig.builder()
+                .image("registry/${}/app")
+                .build();
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void invalidSyntaxInListItem_failsEntireEvaluation() {
+        ContainerConfig c = ContainerConfig.builder()
+                .image("img:1")
+                .command(List.of("--port", "8080$"))
+                .build();
+        assertThrows(InvalidSyntaxException.class, () -> interpolator.interpolate(c, Map.of()));
+    }
+
+    @Test
+    void errorCategories_areDistinguishable() {
+        // 四类错误互不混淆，且都属于插值异常
+        ContainerConfig syntaxErr = ContainerConfig.builder().image("app$").build();
+        ContainerConfig undefinedErr = ContainerConfig.builder().image("${env.X}").build();
+        ContainerConfig circularErr = ContainerConfig.builder()
+                .env(Map.of("A", "${env.A}")).build();
+        ContainerConfig typeErr = ContainerConfig.builder()
+                .image("${entrypoint}").entrypoint(List.of("/app")).build();
+
+        Exception syntax = assertThrows(InvalidSyntaxException.class,
+                () -> interpolator.interpolate(syntaxErr, Map.of()));
+        Exception undefined = assertThrows(UndefinedReferenceException.class,
+                () -> interpolator.interpolate(undefinedErr, Map.of()));
+        Exception circular = assertThrows(CircularReferenceException.class,
+                () -> interpolator.interpolate(circularErr, Map.of()));
+        Exception type = assertThrows(ReferenceTypeException.class,
+                () -> interpolator.interpolate(typeErr, Map.of()));
+
+        // 都可按插值异常统一捕获，但子类型互不相同
+        assertTrue(syntax instanceof InterpolationException);
+        assertTrue(undefined instanceof InterpolationException);
+        assertTrue(circular instanceof InterpolationException);
+        assertTrue(type instanceof InterpolationException);
+        assertTrue(!(syntax instanceof UndefinedReferenceException));
+        assertTrue(!(undefined instanceof InvalidSyntaxException));
+        assertTrue(!(circular instanceof InvalidSyntaxException));
+        assertTrue(!(type instanceof InvalidSyntaxException));
     }
 }

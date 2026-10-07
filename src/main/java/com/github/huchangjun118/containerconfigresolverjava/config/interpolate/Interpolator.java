@@ -18,8 +18,9 @@ import java.util.Set;
  *   <li>{@code $$}：转义，输出字面量 {@code $}（如 {@code $${HOME}} 输出 {@code ${HOME}}）。</li>
  * </ul>
  *
- * <p>未定义引用、循环引用、类型错误分别抛出 {@link UndefinedReferenceException}、
- * {@link CircularReferenceException}、{@link ReferenceTypeException}，绝不静默替换。
+ * <p>未定义引用、循环引用、类型错误、语法错误分别抛出 {@link UndefinedReferenceException}、
+ * {@link CircularReferenceException}、{@link ReferenceTypeException}、{@link InvalidSyntaxException}，
+ * 绝不静默替换，也绝不把不合法的 $ 写法原样输出。
  */
 public class Interpolator {
 
@@ -139,7 +140,12 @@ public class Interpolator {
         int n = template.length();
         while (i < n) {
             char c = template.charAt(i);
-            if (c == '$' && i + 1 < n) {
+            if (c == '$') {
+                if (i + 1 >= n) {
+                    // 字符串末尾孤零零的 $
+                    throw new InvalidSyntaxException(
+                            "dangling '$' at end of value: " + template);
+                }
                 char next = template.charAt(i + 1);
                 if (next == '$') {
                     // 转义：$$ -> $
@@ -150,13 +156,20 @@ public class Interpolator {
                 if (next == '{') {
                     int close = template.indexOf('}', i + 2);
                     if (close < 0) {
-                        throw new InterpolationException("unterminated reference in: " + template);
+                        throw new InvalidSyntaxException("unterminated reference in: " + template);
                     }
                     String spec = template.substring(i + 2, close);
+                    if (spec.isEmpty()) {
+                        throw new InvalidSyntaxException("empty reference ${} in: " + template);
+                    }
                     out.append(resolveReference(spec, scalars, env, labels, external, stack));
                     i = close + 1;
                     continue;
                 }
+                // $ 后既不是合法引用也不是合法转义
+                throw new InvalidSyntaxException(
+                        "invalid '$' sequence '$" + next + "' in: " + template
+                                + " (use $$ for a literal dollar sign or ${name} for a reference)");
             }
             out.append(c);
             i++;
